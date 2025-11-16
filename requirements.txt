@@ -1,9 +1,6 @@
 streamlit==1.36.0
-tensorflow-cpu==2.15.0
-keras==2.15.0
-numpy==1.26.4
-pillow
-pandas
-scikit-learn
-matplotlib
+tensorflow-cpu==2.20.0
+opencv-python-headless==4.10.0.84
+Pillow>=10.3.0
+numpy>=1.26,<3
 

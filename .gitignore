@@ -205,3 +205,14 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+# ===== Outputs chung (mặc định ignore outputs*) =====
+outputs*/
+# Giữ riêng thư mục outputs_multi cho app
+!outputs_multi/
+
+# Trong outputs_multi: ignore tất cả...
+outputs_multi/*
+# ...trừ 2 file cần deploy
+!outputs_multi/fruit_model.keras
+!outputs_multi/class_indices.json
+

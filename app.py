@@ -1,7 +1,6 @@
-# app.py — Demo Streamlit dự đoán trái cây theo ảnh upload (phong cách tối giản)
+# app.py — Demo Streamlit dự đoán trái cây theo ảnh upload (đã fix hiển thị ảnh)
 import json
 from pathlib import Path
-import inspect
 import numpy as np
 import streamlit as st
 import tensorflow as tf
@@ -9,64 +8,40 @@ from PIL import Image
 
 st.set_page_config(page_title="Fruit Classifier", page_icon="🍎", layout="centered")
 
-# ====== HẰNG SỐ CẤU HÌNH GIỐNG LÚC ĐẦU ======
 BASE = Path.cwd()
-MODEL_PATH = BASE / "outputs_multi" / "fruit_model.keras"      # hoặc .h5 nếu bạn đã convert
+MODEL_PATH = BASE / "outputs_multi" / "fruit_model.keras"
 CLASSMAP_PATH = BASE / "outputs_multi" / "class_indices.json"
 IMG_SIZE = (224, 224)
 
-# ====== TƯƠNG THÍCH HIỂN THỊ ẢNH CHO MỌI PHIÊN BẢN STREAMLIT ======
 def show_image(img, caption=None):
-    """Hiển thị ảnh tương thích nhiều phiên bản Streamlit."""
-    params = inspect.signature(st.image).parameters
-    if "use_container_width" in params:
+    """Hiển thị ảnh an toàn trên mọi phiên bản Streamlit."""
+    try:
         st.image(img, caption=caption, use_container_width=True)
-    else:
+    except TypeError:
         st.image(img, caption=caption, use_column_width=True)
 
-# ====== TẢI MODEL / CLASS NAMES ======
 @st.cache_resource(show_spinner=False)
 def load_model():
-    m = tf.keras.models.load_model(MODEL_PATH, compile=False)
-    return m
+    return tf.keras.models.load_model(MODEL_PATH, compile=False)
 
-def _read_class_names(path: Path):
-    """Trả về danh sách tên lớp theo index.
-    Hỗ trợ:
-      1) { "apple": 0, "banana": 1, ... }  (label -> index)
-      2) { "0": "apple", "1": "banana", ... } (index -> label, key dạng chuỗi số)
-      3) ["apple", "banana", ...] (list theo index)
-    """
+def read_classes(path: Path):
     with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    # list -> dùng trực tiếp
-    if isinstance(data, list):
-        return data
-
-    # dict -> phân biệt 2 kiểu
-    if isinstance(data, dict):
-        keys = list(data.keys())
-        # index->label (key là số)
-        if all(k.isdigit() for k in keys):
-            pairs = sorted(((int(k), v) for k, v in data.items()), key=lambda x: x[0])
-            return [label for _, label in pairs]
-        # label->index
-        vals = list(data.values())
-        if all(isinstance(v, int) for v in vals):
-            pairs = sorted(((v, k) for k, v in data.items()), key=lambda x: x[0])
-            return [label for _, label in pairs]
-        # fallback: trả về theo key
-        return list(data.keys())
-
-    # fallback cuối
-    return [str(x) for x in data]
+        mp = json.load(f)
+    if isinstance(mp, list):
+        return mp
+    if isinstance(mp, dict):
+        # { "0": "apple", ... } hoặc { "apple": 0, ... }
+        if all(str(k).isdigit() for k in mp.keys()):
+            return [mp[str(i)] for i in range(len(mp))]
+        else:
+            inv = sorted(((v, k) for k, v in mp.items()), key=lambda x: x[0])
+            return [name for _, name in inv]
+    return [str(x) for x in mp]
 
 @st.cache_resource(show_spinner=False)
 def load_classes():
-    return _read_class_names(CLASSMAP_PATH)
+    return read_classes(CLASSMAP_PATH)
 
-# ====== KHỞI TẠO ======
 model = load_model()
 classes = load_classes()
 
@@ -79,26 +54,17 @@ files = st.file_uploader(
     accept_multiple_files=True
 )
 
-# ====== SUY LUẬN ======
 if files:
     for f in files:
-        # Đọc & chuẩn hoá ảnh
         img = Image.open(f).convert("RGB").resize(IMG_SIZE, Image.BICUBIC)
         x = np.asarray(img, dtype=np.float32)[None, ...] / 255.0
-
-        # Dự đoán
         logits = model.predict(x, verbose=0)
         probs = tf.nn.softmax(logits, axis=1).numpy()[0]
-
         idx = int(np.argmax(probs))
-        pred_name = classes[idx]
-        conf = float(probs[idx]) * 100.0
 
-        # Hiển thị
         show_image(img, caption=f.name)
-        st.markdown(f"**Dự đoán:** `{pred_name}`  —  **Độ tự tin:** **{conf:.2f}%**")
+        st.markdown(f"**Dự đoán:** `{classes[idx]}` — **Độ tự tin:** {probs[idx]*100:.2f}%")
 
-        # Top-3
         top3 = probs.argsort()[-3:][::-1]
         st.write("**Top-3:**")
         for k in top3:

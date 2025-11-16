@@ -1,6 +1,5 @@
-# app.py — Streamlit Fruit Classifier (upload ảnh an toàn & debug rõ ràng)
+# app.py — Streamlit Fruit Classifier (bản tối giản, an toàn upload)
 import json
-import inspect
 from io import BytesIO
 from pathlib import Path
 
@@ -12,64 +11,38 @@ from PIL import Image, UnidentifiedImageError
 # ================= Cấu hình =================
 st.set_page_config(page_title="Fruit Classifier", page_icon="🍎", layout="centered")
 
-BASE = Path.cwd()  # đúng như bạn muốn
-MODEL_PATH = BASE / "outputs_multi" / "fruit_model.keras"
-CLASSMAP_PATH = BASE / "outputs_multi" / "class_indices.json"
+BASE = Path.cwd()
+MODEL_PATH = BASE / "outputs_multi" / "fruit_model.keras"       # GIỮ ĐÚNG THƯ MỤC
+CLASSMAP_PATH = BASE / "outputs_multi" / "class_indices.json"   # GIỮ ĐÚNG THƯ MỤC
 IMG_SIZE = (224, 224)
-ABSTAIN_THRESHOLD = 0.60  # nếu max-prob < ngưỡng, coi là "không phải trái cây"
+ABSTAIN_THRESHOLD = 0.60  # nếu max prob < ngưỡng ⇒ coi là "không phải trái cây"
 
-# ============== Tiện ích hiển thị ảnh (tương thích mọi bản Streamlit) ==============
-def show_image(img, caption=None):
-    params = inspect.signature(st.image).parameters
-    if "use_container_width" in params:
-        st.image(img, caption=caption, use_container_width=True)
-    else:
-        st.image(img, caption=caption, use_column_width=True)
-
-# ============== Tải model & class map (cache) ==============
+# ================= Tải model & class map (cache) =================
 @st.cache_resource(show_spinner=False)
 def load_model():
-    # compile=False để tránh yêu cầu khớp optimizer/metrics khi load
+    # compile=False để tránh lỗi optimizer/metrics khi load
     return tf.keras.models.load_model(MODEL_PATH, compile=False)
-
-def _normalize_classes(obj):
-    # hỗ trợ list hoặc dict {"0":"apple"} hoặc {"apple":0}
-    if isinstance(obj, list):
-        return obj
-    if isinstance(obj, dict):
-        # kiểu {"0":"apple"}
-        if all(str(k).isdigit() for k in obj.keys()):
-            return [obj[str(i)] for i in range(len(obj))]
-        # kiểu {"apple": 0}
-        ordered = sorted(((idx, name) for name, idx in obj.items()), key=lambda x: x[0])
-        return [name for _, name in ordered]
-    return [str(x) for x in obj]
 
 @st.cache_resource(show_spinner=False)
 def load_classes():
     with open(CLASSMAP_PATH, "r", encoding="utf-8") as f:
-        mp = json.load(f)
-    return _normalize_classes(mp)
+        mp = json.load(f)  # hỗn hợp {"0": "apple"} hoặc list
+    if isinstance(mp, list):
+        return mp
+    # dạng {"0": "apple", "1": "banana", ...}
+    return [mp[str(i)] for i in range(len(mp))]
 
-# ============== Đọc ảnh upload an toàn ==============
+# ================= Tiện ích =================
 def read_uploaded_image(uploaded_file) -> Image.Image:
-    """
-    Đọc st.uploaded_file an toàn:
-      - Đọc bytes -> BytesIO (không phụ thuộc vị trí con trỏ)
-      - Mở bằng PIL, convert RGB
-    """
-    data = uploaded_file.read()
+    """Đọc ảnh từ st.file_uploader an toàn (bytes -> PIL RGB)."""
+    data = uploaded_file.getvalue()  # an toàn hơn read/seek
     if not data:
-        # có thể con trỏ đang ở cuối file do xem trước -> reset rồi đọc lại
-        uploaded_file.seek(0)
-        data = uploaded_file.read()
-    bio = BytesIO(data)
-    img = Image.open(bio)
+        raise ValueError("File rỗng hoặc không đọc được bytes.")
+    img = Image.open(BytesIO(data))
     return img.convert("RGB")
 
-# ============== Suy luận ==============
 def predict_pil(pil_img: Image.Image, classes):
-    # resize
+    # resize + chuẩn hóa đúng như khi train (đÃ /255.0)
     img_resized = pil_img.resize(IMG_SIZE, Image.BICUBIC)
     x = np.asarray(img_resized, dtype=np.float32)[None, ...] / 255.0
     logits = model.predict(x, verbose=0)
@@ -77,33 +50,27 @@ def predict_pil(pil_img: Image.Image, classes):
     idx = int(np.argmax(probs))
     return img_resized, probs, idx, float(probs[idx])
 
-# ============== Khởi tạo model/lớp ==============
+# ================= Khởi tạo =================
 try:
     model = load_model()
     classes = load_classes()
 except Exception as e:
     st.error(f"Không thể load model/class map: {e}")
-    with st.expander("Debug paths"):
-        st.write("MODEL_PATH:", str(MODEL_PATH))
-        st.write("CLASSMAP_PATH:", str(CLASSMAP_PATH))
-        st.write("Tồn tại model?", MODEL_PATH.exists())
-        st.write("Tồn tại class map?", CLASSMAP_PATH.exists())
     st.stop()
 
-# ============== UI ==============
+# ================= UI =================
 st.title("🍎🍌🍊 Fruit Classifier Demo")
 st.caption("Upload ảnh để mô hình dự đoán loại trái cây (MobileNetV2 fine-tune).")
 
-# Debug panel
-with st.expander("🔧 Debug môi trường"):
+with st.expander("🔧 Debug nhanh"):
     import platform, PIL
     st.write("Python:", platform.python_version())
     st.write("Streamlit:", st.__version__)
     st.write("TensorFlow:", tf.__version__)
     st.write("Pillow:", PIL.__version__)
-    st.write("Classes:", classes)
     st.write("MODEL_PATH tồn tại:", MODEL_PATH.exists())
     st.write("CLASSMAP_PATH tồn tại:", CLASSMAP_PATH.exists())
+    st.write("Classes:", classes)
 
 files = st.file_uploader(
     "Chọn 1 hoặc nhiều ảnh (jpg/png/webp/bmp)",
@@ -114,15 +81,16 @@ files = st.file_uploader(
 if files:
     for uf in files:
         try:
-            pil = read_uploaded_image(uf)          # ⇐ cách đọc an toàn
+            pil = read_uploaded_image(uf)
             img_resized, probs, idx, p = predict_pil(pil, classes)
 
-            # hiển thị ảnh bằng hàm tương thích
-            show_image(img_resized, caption=getattr(uf, "name", "uploaded"))
+            # CHỈ dùng use_column_width (tương thích mọi bản)
+            st.image(img_resized, caption=getattr(uf, "name", "uploaded"), use_column_width=True)
 
             if p < ABSTAIN_THRESHOLD:
                 st.markdown(
-                    f"**Kết luận:** Không chắc là trái cây (max prob {p*100:.1f}% < {ABSTAIN_THRESHOLD*100:.0f}%)."
+                    f"**Kết luận:** Không chắc là trái cây "
+                    f"(max prob {p*100:.1f}% < {ABSTAIN_THRESHOLD*100:.0f}%)."
                 )
             else:
                 st.markdown(f"**Dự đoán:** `{classes[idx]}` — **Độ tự tin:** {p*100:.2f}%")
@@ -132,6 +100,7 @@ if files:
             st.write("**Top-3:**")
             for k in top3:
                 st.write(f"- {classes[int(k)]}: {probs[int(k)]*100:.2f}%")
+
             st.divider()
 
         except UnidentifiedImageError:

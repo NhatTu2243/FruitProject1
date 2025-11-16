@@ -1,167 +1,253 @@
-# app.py — Streamlit demo cho phân loại trái cây (có "unknown" bằng threshold)
+# app.py
+# Fruit classifier (14 classes) + Unknown detector
+# Streamlit + TensorFlow Keras (.keras model)
+
+import io
 import json
-from pathlib import Path
+import time
 import numpy as np
-from PIL import Image
 import streamlit as st
+from PIL import Image
+
+# OpenCV cho tiền xử lý. Nếu không có sẽ cảnh báo rõ.
+try:
+    import cv2
+    _HAS_CV2 = True
+except Exception as e:
+    _HAS_CV2 = False
+
+# TensorFlow / Keras
 import tensorflow as tf
+from tensorflow.keras.models import load_model
 
-# ===================== Cấu hình cơ bản =====================
-BASE = Path(__file__).resolve().parent
-DEFAULT_MODEL = BASE / "outputs_multi" / "fruit_model.keras"
-DEFAULT_CLASSMAP = BASE / "outputs_multi" / "class_indices.json"
-DEFAULT_IMG_SIZE = 224
 
-st.set_page_config(page_title="Fruit Classifier", page_icon="🍎", layout="wide")
-st.title("🍎🍌🍊 Fruit Classifier – Streamlit App")
-
-# ===================== Tiện ích =====================
+# =========================
+# Utils
+# =========================
 @st.cache_resource(show_spinner=False)
-def load_classes(class_map_path: Path):
-    with open(class_map_path, "r", encoding="utf-8") as f:
-        mp = json.load(f)  # {"0": "apple", ...}
-    classes = [mp[str(i)] for i in range(len(mp))]
-    return classes
+def load_keras_model(model_path: str):
+    t0 = time.time()
+    model = load_model(model_path, compile=False)
+    dt = time.time() - t0
+    st.info(f"✅ Đã nạp model: `{model_path}` (t={dt:.2f}s)")
+    return model
 
-@st.cache_resource(show_spinner=True)
-def safe_load_model(model_path: Path):
-    """
-    Load model. Nếu model cũ có Lambda(preprocess_input) thì thêm custom_objects.
-    Model hiện tại dùng chuẩn hóa trong graph nên thường load trực tiếp.
-    """
-    try:
-        return tf.keras.models.load_model(model_path)
-    except Exception:
-        return tf.keras.models.load_model(
-            model_path,
-            custom_objects={"preprocess_input": tf.keras.applications.mobilenet_v2.preprocess_input},
-        )
 
-def prepare_image(pil_img: Image.Image, img_size: int = DEFAULT_IMG_SIZE) -> np.ndarray:
-    """Resize đúng kích thước; KHÔNG /255 vì model đã có lớp chuẩn hóa."""
-    img = pil_img.convert("RGB").resize((img_size, img_size))
-    arr = np.array(img, dtype=np.float32)
-    arr = np.expand_dims(arr, axis=0)  # (1, H, W, 3)
+@st.cache_resource(show_spinner=False)
+def load_class_indices(json_path: str):
+    with open(json_path, "r", encoding="utf-8") as f:
+        class_to_idx = json.load(f)  # {"cachua":0, "cam":1, ...}
+    num_classes = max(class_to_idx.values()) + 1
+    idx_to_class = [None] * num_classes
+    for cls, idx in class_to_idx.items():
+        idx_to_class[idx] = cls
+    # Kiểm tra tính đầy đủ
+    assert all(lbl is not None for lbl in idx_to_class), "class_indices.json thiếu/nhảy số!"
+    return class_to_idx, idx_to_class
+
+
+def _pil_to_bgr(pil_img: Image.Image) -> np.ndarray:
+    """PIL RGB -> OpenCV BGR (np.uint8)"""
+    rgb = np.array(pil_img.convert("RGB"))
+    bgr = rgb[:, :, ::-1].copy()
+    return bgr
+
+
+def center_crop_square(img_rgb: np.ndarray) -> np.ndarray:
+    h, w = img_rgb.shape[:2]
+    side = min(h, w)
+    y0 = (h - side) // 2
+    x0 = (w - side) // 2
+    return img_rgb[y0:y0 + side, x0:x0 + side]
+
+
+def preprocess_image(img_bgr: np.ndarray, img_size: int) -> np.ndarray:
+    """
+    Tiền xử lý giống lúc train:
+      - BGR->RGB
+      - Center-crop hình vuông
+      - Resize về (img_size, img_size) với INTER_AREA
+      - Scale [0,1]  (nếu lúc train dùng preprocess khác, thay đổi tại đây)
+    """
+    if not _HAS_CV2:
+        # fallback thuần PIL nếu thiếu OpenCV (ít gặp trên Cloud)
+        img_rgb = Image.fromarray(img_bgr[:, :, ::-1]).convert("RGB")
+        # crop vuông
+        w, h = img_rgb.size
+        side = min(w, h)
+        left = (w - side) // 2
+        top = (h - side) // 2
+        img_rgb = img_rgb.crop((left, top, left + side, top + side))
+        img_rgb = img_rgb.resize((img_size, img_size))
+        arr = np.array(img_rgb).astype(np.float32) / 255.0
+        return arr
+
+    # có cv2
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img_rgb = center_crop_square(img_rgb)
+    img_rgb = cv2.resize(img_rgb, (img_size, img_size), interpolation=cv2.INTER_AREA)
+    arr = img_rgb.astype(np.float32) / 255.0
     return arr
 
-def predict_one(model, classes, pil_img: Image.Image, topk: int, img_size: int):
-    x = prepare_image(pil_img, img_size)
-    probs = model.predict(x, verbose=0)[0]  # (C,)
-    top_indices = np.argsort(probs)[::-1][:topk]
-    top_labels = [classes[i] for i in top_indices]
-    top_scores = [float(probs[i]) for i in top_indices]
-    pred_idx = int(np.argmax(probs))
-    return classes[pred_idx], float(probs[pred_idx]), list(zip(top_labels, top_scores)), probs
 
-def apply_unknown(pred_label: str, pred_conf: float, threshold: float) -> str:
-    """Nếu xác suất < threshold, trả về 'unknown'."""
-    return pred_label if pred_conf >= threshold else "unknown"
+def tta_predict(model, img_arr: np.ndarray) -> np.ndarray:
+    """
+    TTA nhẹ: gốc + flip ngang. img_arr: (H,W,3) [0,1]
+    """
+    batch = np.stack([img_arr, img_arr[:, ::-1, :]], axis=0)  # (2,H,W,3)
+    probs = model.predict(batch, verbose=0)                   # (2,C)
+    return probs.mean(axis=0)                                 # (C,)
 
-# ===================== Sidebar =====================
-st.sidebar.header("⚙️ Cấu hình")
-model_path = Path(st.sidebar.text_input("Model file", str(DEFAULT_MODEL)))
-classmap_path = Path(st.sidebar.text_input("class_indices.json", str(DEFAULT_CLASSMAP)))
-img_size = st.sidebar.number_input("Kích thước ảnh (img_size)", 64, 512, DEFAULT_IMG_SIZE, step=32)
-topk = st.sidebar.slider("Top-k", 1, 10, 3)
 
-st.sidebar.subheader("🛡️ Phát hiện 'không phải trái cây'")
-threshold = st.sidebar.slider("Ngưỡng tự tin (0–1)", 0.0, 1.0, 0.60, step=0.01)
-st.sidebar.caption("Nếu xác suất dự đoán cao nhất < ngưỡng → gán 'unknown'.")
+def draw_topk_bar(top_labels, top_scores):
+    import pandas as pd
+    df = pd.DataFrame({"label": top_labels, "score": top_scores})
+    df = df.set_index("label")
+    st.bar_chart(df)
 
-show_prob_table = st.sidebar.checkbox("Hiện bảng xác suất đầy đủ", value=False)
 
-# Cache: load model & classes
-try:
-    classes = load_classes(classmap_path)
-    model = safe_load_model(model_path)
-    st.sidebar.success(f"Đã load model: {model_path.name}")
-except Exception as e:
-    st.sidebar.error(f"Không load được model/class map: {e}")
-    st.stop()
+def predict_one(model, idx_to_class, img_bgr, img_size, topk_view,
+                conf_thresh, margin_thresh):
+    img = preprocess_image(img_bgr, img_size)         # (H,W,3), float32 [0,1]
+    x = img  # giữ để hiển thị nếu cần
+    probs = tta_predict(model, img)                   # (C,)
 
-st.sidebar.write(f"**Classes ({len(classes)}):**")
-st.sidebar.write(", ".join(classes))
+    # top-k
+    top_idx = np.argsort(-probs)[:topk_view]
+    top_labels = [idx_to_class[i] for i in top_idx]
+    top_scores = [float(probs[i]) for i in top_idx]
 
-# ===================== Tabs giao diện =====================
-tab1, tab2 = st.tabs(["📤 Upload ảnh", "📁 Dự đoán cả thư mục"])
+    # unknown rule
+    max_conf = float(probs.max())
+    # chênh lệch top1-top2 (ổn định bằng partition)
+    if probs.size >= 2:
+        top2 = np.partition(probs, -2)[-2:]
+        margin = float(top2[-1] - top2[-2])
+    else:
+        margin = 1.0
 
-# ---- Tab 1: Upload ảnh ----
-with tab1:
+    is_unknown = (max_conf < conf_thresh) or (margin < margin_thresh)
+    if is_unknown:
+        pred_label = None
+    else:
+        pred_label = idx_to_class[int(np.argmax(probs))]
+
+    return {
+        "probs": probs,
+        "top_labels": top_labels,
+        "top_scores": top_scores,
+        "max_conf": max_conf,
+        "margin": margin,
+        "pred_label": pred_label,
+        "is_unknown": is_unknown,
+        "processed_rgb": (x * 255).astype(np.uint8),
+    }
+
+
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title="Fruit Classifier + Unknown", layout="wide")
+st.title("🍎 Fruit Classifier (14 classes) + Unknown detector")
+
+with st.sidebar:
+    st.header("⚙️ Cấu hình")
+
+    # Đường dẫn mặc định khi chạy trên Streamlit Cloud
+    default_model = "outputs_multi/fruit_model.keras"
+    default_json = "outputs_multi/class_indices.json"
+
+    model_path = st.text_input("Model file (.keras)", default_model)
+    class_indices_path = st.text_input("class_indices.json", default_json)
+
+    img_size = st.number_input("Kích thước ảnh (img_size)", 64, 640, 224, 1)
+    topk_view = st.slider("Top-k hiển thị", 1, 10, 3, 1)
+
+    st.markdown("### 🚫 Phát hiện 'không phải trái cây'")
+    strict = st.checkbox("Bật chế độ nghiêm ngặt", value=True)
+    if strict:
+        conf_thresh = st.slider("Ngưỡng tự tin (0–1)", 0.0, 1.0, 0.60, 0.01)
+        margin_thresh = st.slider("Ngưỡng chênh lệch top1–top2", 0.0, 1.0, 0.25, 0.01)
+    else:
+        conf_thresh = st.slider("Ngưỡng tự tin (0–1)", 0.0, 1.0, 0.50, 0.01)
+        margin_thresh = st.slider("Ngưỡng chênh lệch top1–top2", 0.0, 1.0, 0.20, 0.01)
+
+    # Nạp model & class map
+    load_btn = st.button("📥 Nạp model & class map", type="primary")
+
+# Tự động nạp khi mở lần đầu
+if "model" not in st.session_state or load_btn:
+    try:
+        model = load_keras_model(model_path)
+        class_to_idx, idx_to_class = load_class_indices(class_indices_path)
+        st.session_state["model"] = model
+        st.session_state["idx_to_class"] = idx_to_class
+        st.sidebar.success("Đã load model & class map!")
+    except Exception as e:
+        st.sidebar.error(f"Không thể nạp model/map: {e}")
+        st.stop()
+
+model = st.session_state["model"]
+idx_to_class = st.session_state["idx_to_class"]
+
+# Debug nhanh cho đúng thứ tự nhãn
+with st.expander("🔎 Debug: idx → class"):
+    st.code(", ".join(f"{i}:{lbl}" for i, lbl in enumerate(idx_to_class)), language="text")
+
+# =========================
+# Nhập ảnh & dự đoán
+# =========================
+left, right = st.columns([1, 1])
+
+with left:
+    st.subheader("📤 Tải ảnh lên")
     files = st.file_uploader(
-        "Chọn 1 hoặc nhiều ảnh (jpg/png/webp/bmp...)",
-        type=["jpg", "jpeg", "png", "webp", "bmp"],
+        "Chọn 1-n ảnh (png/jpg/webp...)",
+        type=["png", "jpg", "jpeg", "bmp", "webp"],
         accept_multiple_files=True
     )
-    if files:
-        cols = st.columns(3)
-        for i, f in enumerate(files):
-            try:
-                pil = Image.open(f)
-                pred, conf, top_list, all_probs = predict_one(
-                    model, classes, pil, topk=topk, img_size=img_size
-                )
-                final_label = apply_unknown(pred, conf, threshold)
 
-                with cols[i % 3]:
-                    st.image(pil, caption=f.name, use_column_width=True)
-                    if final_label == "unknown":
-                        st.markdown(f"**⚠️ Không chắc (có thể không phải trái cây)** — max conf: `{conf:.3f}`")
-                        st.markdown(f"*Gợi ý:* tăng ngưỡng, hoặc thu thập thêm dữ liệu 'non-fruit' để huấn luyện mở rộng.")
+    st.caption(
+        "Gợi ý: thử thêm ảnh 'vật thể lạ' (bút/xe/biển báo) để kiểm tra bộ lọc unknown."
+    )
+
+with right:
+    if files:
+        for upl in files:
+            try:
+                pil = Image.open(io.BytesIO(upl.read())).convert("RGB")
+                bgr = _pil_to_bgr(pil)
+
+                out = predict_one(
+                    model, idx_to_class, bgr,
+                    img_size, topk_view,
+                    conf_thresh, margin_thresh
+                )
+
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    st.image(pil, caption=upl.name, use_container_width=True)
+
+                with col2:
+                    if out["is_unknown"]:
+                        st.warning(
+                            f"⚠️ **Không phải trái cây (unknown)** — "
+                            f"max conf **{out['max_conf']:.3f}**, margin **{out['margin']:.3f}**"
+                        )
                     else:
-                        st.markdown(f"**✅ Pred:** `{final_label}` — **Conf:** `{conf:.3f}`")
+                        st.success(
+                            f"✅ **Pred: {out['pred_label']}** — Conf: **{out['max_conf']:.3f}** "
+                            f"(margin {out['margin']:.3f})"
+                        )
 
                     st.markdown("**Top-k:**")
-                    for lbl, sc in top_list:
-                        st.write(f"- {lbl}: {sc:.3f}")
+                    for lbl, sc in zip(out["top_labels"], out["top_scores"]):
+                        st.write(f"• {lbl}: {sc:.3f}")
 
-                    if show_prob_table:
-                        import pandas as pd
-                        df_prob = pd.DataFrame({"class": classes, "probability": all_probs}).set_index("class")
-                        st.bar_chart(df_prob["probability"])
-                        st.caption("Xác suất theo lớp (theo class_indices.json)")
+                    draw_topk_bar(out["top_labels"], out["top_scores"])
+
             except Exception as e:
-                st.warning(f"Lỗi xử lý {f.name}: {e}")
-
-# ---- Tab 2: Dự đoán thư mục ----
-with tab2:
-    st.info("Nhập đường dẫn thư mục ảnh trên máy (Windows): ví dụ `C:\\Users\\nhatt\\Pictures\\fruits_test`")
-    folder = st.text_input("Đường dẫn thư mục")
-    run = st.button("Quét & Dự đoán")
-    if run:
-        p = Path(folder)
-        if not p.exists() or not p.is_dir():
-            st.error("Thư mục không tồn tại.")
-        else:
-            exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-            imgs = [fp for fp in p.rglob("*") if fp.suffix.lower() in exts]
-            if not imgs:
-                st.warning("Không tìm thấy ảnh hợp lệ trong thư mục.")
-            else:
-                rows = []
-                prog = st.progress(0, text="Đang dự đoán...")
-                for idx, fp in enumerate(imgs, start=1):
-                    try:
-                        pil = Image.open(fp)
-                        pred, conf, top_list, _ = predict_one(model, classes, pil, topk=topk, img_size=img_size)
-                        final_label = apply_unknown(pred, conf, threshold)
-                        rows.append((fp.name, str(fp.parent.name), final_label, conf))
-                    except Exception as e:
-                        rows.append((fp.name, "", f"ERROR: {e}", 0.0))
-                    prog.progress(idx / len(imgs), text=f"{idx}/{len(imgs)} ảnh")
-
-                st.success(f"Đã xử lý {len(rows)} ảnh.")
-                import pandas as pd
-                df = pd.DataFrame(rows, columns=["filename", "folder", "pred_or_unknown", "confidence"])
-                st.dataframe(df, use_container_width=True)
-                st.download_button(
-                    "Tải kết quả CSV",
-                    data=df.to_csv(index=False).encode("utf-8"),
-                    file_name="predictions.csv",
-                    mime="text/csv",
-                )
-
-st.caption(
-    "Tip: Nếu muốn phát hiện 'không phải trái cây' tốt hơn, hãy thêm dữ liệu lớp 'non-fruit' và huấn luyện lại (open-set). "
-    "Hiện tại dùng ngưỡng xác suất để gán 'unknown'."
-)
+                st.error(f"Ảnh `{upl.name}` lỗi: {e}")
+    else:
+        st.info("Hãy tải lên ít nhất một ảnh để dự đoán.")
 

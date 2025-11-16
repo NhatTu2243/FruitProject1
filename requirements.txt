@@ -1,8 +1,9 @@
-streamlit>=1.36
-tensorflow-cpu==2.15.0.post1
+streamlit==1.36.0
+tensorflow-cpu==2.15.0
 keras==2.15.0
+numpy==1.26.4
 pillow
-numpy
 pandas
 scikit-learn
 matplotlib
+
